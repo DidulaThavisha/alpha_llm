@@ -47,67 +47,81 @@ class MCTSSearch:
         num_candidates: int = 8,
         max_line_tokens: int = 128,
     ) -> List[Tuple[List[int], str, float]]:
-        """Generate candidate lines using beam search / sampling.
+        """Generate candidate lines via temperature sampling.
+
+        Computes the base KV cache ONCE, then generates each candidate
+        autoregressively from the cached prefix (no deep clone needed).
 
         Returns list of (token_ids, text, log_probability) for each candidate line.
-        A "line" ends at a newline token or EOS.
         """
         device = self.model.device
         tokenizer = self.model.tokenizer
         eos_id = tokenizer.eos_token_id
-        # Find newline token id
         newline_ids = tokenizer.encode("\n", add_special_tokens=False)
         newline_id = newline_ids[-1] if newline_ids else None
 
-        candidates = []
+        # === Step 1: compute base KV cache from the full prefix ONCE ===
+        if past_key_values is None:
+            base_out = self.model.forward(input_ids, use_cache=True)
+            base_kv = base_out["past_key_values"]
+            base_logits = base_out["logits"][:, -1, :].float()
+        else:
+            base_kv = past_key_values
+            base_out = self.model.forward(input_ids[:, -1:], past_key_values=base_kv, use_cache=True)
+            base_kv = base_out["past_key_values"]
+            base_logits = base_out["logits"][:, -1, :].float()
 
-        # Generate diverse candidates via temperature sampling
-        temperatures = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 0.3, 0.5]
+        candidates = []
+        temperatures = [0.3, 0.5, 0.7, 0.9, 1.0, 1.2, 0.4, 0.8]
         temperatures = temperatures[:num_candidates]
 
         for temp in temperatures:
             tokens = []
             log_prob_sum = 0.0
-            cur_ids = input_ids.clone()
-            cur_kv = clone_kv_cache(past_key_values) if past_key_values is not None else None
-            first_step = True
 
-            for step in range(max_line_tokens):
-                # On first step, pass full input; after that, just the new token with KV cache
-                step_ids = cur_ids if first_step else torch.tensor([[tokens[-1]]], device=device)
+            # Sample first token from base logits (shared across all candidates)
+            top_k = self.config.top_k_tokens
+            top_values, top_indices = torch.topk(base_logits, top_k, dim=-1)
+            scaled = top_values / max(temp, 0.1)
+            probs = F.softmax(scaled, dim=-1)
+            if probs.isnan().any() or (probs < 0).any():
+                probs = torch.ones_like(probs) / probs.shape[-1]
 
-                out = self.model.forward(
-                    step_ids,
-                    attention_mask=None,  # not needed when all positions attend
-                    past_key_values=cur_kv,
-                    use_cache=True,
-                )
-                logits = out["logits"][:, -1, :].float()  # [1, vocab], cast to fp32
-                cur_kv = out["past_key_values"]
-                first_step = False
+            idx = torch.multinomial(probs, 1)
+            token_id = top_indices[0, idx[0, 0]].item()
+            log_prob_sum += F.log_softmax(scaled, dim=-1)[0, idx[0, 0]].item()
+            tokens.append(token_id)
 
-                # Apply top-k filtering
-                top_k = self.config.top_k_tokens
+            if token_id == eos_id or token_id == newline_id:
+                text = tokenizer.decode(tokens, skip_special_tokens=False)
+                candidates.append((tokens, text, log_prob_sum))
+                continue
+
+            # Continue generating from the diverged token — build a fresh KV cache
+            # by feeding the base prefix + this token
+            cur_input = torch.tensor([[token_id]], device=device)
+            cur_out = self.model.forward(cur_input, past_key_values=base_kv, use_cache=True)
+            cur_kv = cur_out["past_key_values"]
+
+            for step in range(1, max_line_tokens):
+                logits = cur_out["logits"][:, -1, :].float()
                 top_values, top_indices = torch.topk(logits, top_k, dim=-1)
-
-                # Apply temperature and sample
                 scaled = top_values / max(temp, 0.1)
                 probs = F.softmax(scaled, dim=-1)
-
-                # Guard against numerical issues
-                if probs.isnan().any() or probs.isinf().any() or (probs < 0).any():
+                if probs.isnan().any() or (probs < 0).any():
                     probs = torch.ones_like(probs) / probs.shape[-1]
 
-                idx = torch.multinomial(probs, 1)  # [1, 1]
+                idx = torch.multinomial(probs, 1)
                 token_id = top_indices[0, idx[0, 0]].item()
-                token_log_prob = F.log_softmax(scaled, dim=-1)[0, idx[0, 0]].item()
-
+                log_prob_sum += F.log_softmax(scaled, dim=-1)[0, idx[0, 0]].item()
                 tokens.append(token_id)
-                log_prob_sum += token_log_prob
 
-                # Check for line end
                 if token_id == eos_id or token_id == newline_id:
                     break
+
+                cur_input = torch.tensor([[token_id]], device=device)
+                cur_out = self.model.forward(cur_input, past_key_values=cur_kv, use_cache=True)
+                cur_kv = cur_out["past_key_values"]
 
             text = tokenizer.decode(tokens, skip_special_tokens=False)
             candidates.append((tokens, text, log_prob_sum))
@@ -282,80 +296,80 @@ class MCTSSearch:
         prompt_ids: List[int],
         use_mcts: bool = True,
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        """Generate a complete code solution using MCTS-guided line-by-line generation.
+        """Generate a complete code solution.
 
-        Args:
-            prompt_ids: tokenized problem prompt
-            use_mcts: if False, use greedy decoding (for evaluation)
-
-        Returns:
-            (generated_code, trajectory) where trajectory is list of
-            {state_tokens, mcts_policy, selected_line} dicts for training
+        If use_mcts=True: MCTS-guided line-by-line generation with trajectory.
+        If use_mcts=False: fast greedy autoregressive decoding with KV cache.
         """
+        if not use_mcts:
+            return self._greedy_generate(prompt_ids), []
+
+        return self._mcts_generate(prompt_ids)
+
+    def _greedy_generate(self, prompt_ids: List[int]) -> str:
+        """Fast greedy generation using KV cache — no MCTS overhead."""
+        device = self.model.device
+        tokenizer = self.model.tokenizer
+        eos_id = tokenizer.eos_token_id
+
+        input_ids = torch.tensor([prompt_ids], device=device)
+        out = self.model.forward(input_ids, use_cache=True)
+        kv = out["past_key_values"]
+
+        generated = []
+        for _ in range(self.config.max_tokens):
+            logits = out["logits"][:, -1, :].float()
+            token_id = logits.argmax(dim=-1).item()
+            generated.append(token_id)
+
+            if token_id == eos_id:
+                break
+
+            next_input = torch.tensor([[token_id]], device=device)
+            out = self.model.forward(next_input, past_key_values=kv, use_cache=True)
+            kv = out["past_key_values"]
+
+        return tokenizer.decode(generated, skip_special_tokens=True)
+
+    def _mcts_generate(self, prompt_ids: List[int]) -> Tuple[str, List[Dict[str, Any]]]:
+        """MCTS-guided line-by-line generation with trajectory recording."""
         code_tokens = []
         trajectory = []
         tokenizer = self.model.tokenizer
 
         for line_num in range(self.config.max_lines):
-            if use_mcts:
-                result = self.search(
-                    prompt_ids=prompt_ids,
-                    code_tokens_so_far=code_tokens,
-                    line_number=line_num,
-                )
+            result = self.search(
+                prompt_ids=prompt_ids,
+                code_tokens_so_far=code_tokens,
+                line_number=line_num,
+            )
 
-                if not result.policy:
-                    break
+            if not result.policy:
+                break
 
-                selected_child_idx = result.selected_child_idx
+            selected_child_idx = result.selected_child_idx
 
-                # Build root to get the selected child
-                # We need to regenerate the root to get the actual child node
-                root = MCTSNode(line_tokens=code_tokens if code_tokens else None)
-                root._cumulative_tokens = code_tokens.copy()
-                self.expand_node(root, prompt_ids)
+            # Regenerate root to get the selected child's tokens
+            root = MCTSNode(line_tokens=code_tokens if code_tokens else None)
+            root._cumulative_tokens = code_tokens.copy()
+            self.expand_node(root, prompt_ids)
 
-                if selected_child_idx >= len(root.children):
-                    break
+            if selected_child_idx >= len(root.children):
+                break
 
-                selected = root.children[min(selected_child_idx, len(root.children) - 1)]
+            selected = root.children[min(selected_child_idx, len(root.children) - 1)]
 
-                # Record trajectory for training
-                trajectory.append({
-                    "state_tokens": code_tokens.copy(),
-                    "mcts_policy": result.policy,
-                    "selected_line": selected.line_text,
-                    "value_estimate": result.root_value,
-                })
+            trajectory.append({
+                "state_tokens": code_tokens.copy(),
+                "mcts_policy": result.policy,
+                "selected_line": selected.line_text,
+                "value_estimate": result.root_value,
+            })
 
-                # Append selected line tokens
-                code_tokens.extend(selected.line_tokens)
+            code_tokens.extend(selected.line_tokens)
 
-                if selected.is_terminal:
-                    break
-            else:
-                # Greedy: generate one line without MCTS
-                device = self.model.device
-                all_tokens = prompt_ids + code_tokens
-                input_ids = torch.tensor([all_tokens], device=device)
-                attention_mask = torch.ones_like(input_ids)
-
-                candidates = self.generate_candidate_lines(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    num_candidates=1,
-                    max_line_tokens=128,
-                )
-                if not candidates:
-                    break
-
-                tokens, text, _ = candidates[0]
-                code_tokens.extend(tokens)
-
-                if tokens and tokens[-1] == tokenizer.eos_token_id:
-                    break
-
-            # Check total token count
+            if selected.is_terminal:
+                break
             if len(code_tokens) >= self.config.max_tokens:
                 break
 
