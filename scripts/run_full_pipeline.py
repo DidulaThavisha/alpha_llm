@@ -1,0 +1,192 @@
+"""End-to-end AlphaZero training loop for code generation.
+
+Usage: python -m scripts.run_full_pipeline [--iterations N] [--resume PATH]
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import argparse
+import json
+import time
+import torch
+
+import logger
+from config import get_config, AlphaCodeConfig
+from model import AlphaCodeModel
+from data.dataset import load_problems, get_problems_by_max_rating
+from training.self_play import SelfPlay
+from training.trainer import Trainer
+from training.replay_buffer import ReplayBuffer
+
+
+def get_device(config):
+    if config.device == "auto":
+        if torch.backends.mps.is_available():
+            return "mps"
+        elif torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+    return config.device
+
+
+def get_curriculum_rating(iteration: int, config: AlphaCodeConfig) -> int:
+    for stage in config.training.curriculum_stages:
+        start, end = stage["iterations"]
+        if start <= iteration < end:
+            return stage["max_rating"]
+    return 3500
+
+
+def evaluate_model(model, problems, config):
+    """Evaluate model on problems using greedy decoding."""
+    from mcts.search import MCTSSearch
+    from data.prompt_templates import format_prompt, extract_code
+    from evaluation.test_case_loader import load_test_cases
+    from evaluation.code_executor import CodeExecutor
+    from evaluation.reward import compute_reward
+
+    executor = CodeExecutor(timeout=config.eval.code_timeout)
+    mcts = MCTSSearch(model, config.mcts)
+    results = []
+
+    logger.eval_start(len(problems))
+
+    for problem in problems:
+        prompt_text = format_prompt(problem.prompt)
+        prompt_ids = model.tokenizer.encode(prompt_text, add_special_tokens=True)
+        test_cases = load_test_cases(problem.answer)
+
+        code, _ = mcts.generate_solution(prompt_ids, use_mcts=False)
+        code = extract_code(prompt_text + code)
+        result = executor.evaluate(code, test_cases)
+        reward = compute_reward(result)
+        won = reward == 1.0
+
+        logger.eval_problem(problem.title, problem.rating, result.passed, result.total, won)
+        results.append({"rating": problem.rating, "title": problem.title,
+                        "passed": result.passed, "total": result.total, "won": won})
+
+    wins = sum(1 for r in results if r["won"])
+    logger.eval_summary(wins, len(results))
+    return results
+
+
+def run_pipeline(args):
+    config = get_config()
+    device = get_device(config)
+
+    logger.banner()
+    logger.console.print(f"  Device: [bold]{device}[/] · Model: [bold]{config.model.name}[/]")
+
+    logger.console.print("\n[dim]Loading model...[/]")
+    model = AlphaCodeModel(config.model)
+    model.to_device(device)
+
+    logger.console.print("[dim]Applying LoRA...[/]")
+    model.apply_lora()
+
+    replay_buffer = ReplayBuffer(config.training.replay_buffer_size)
+    self_play = SelfPlay(model, config)
+    trainer = Trainer(model, config)
+
+    if args.resume:
+        trainer.load_checkpoint(args.resume)
+
+    all_problems = load_problems(config.dataset_path)
+    logger.console.print(f"  Loaded [bold]{len(all_problems)}[/] problems (rating {all_problems[0].rating}–{all_problems[-1].rating})")
+
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    os.makedirs(config.log_dir, exist_ok=True)
+
+    training_log = []
+    num_iterations = args.iterations or config.training.max_iterations
+
+    # === MAIN LOOP ===
+    for iteration in range(trainer.iteration, num_iterations):
+        iter_start = time.time()
+
+        max_rating = get_curriculum_rating(iteration, config)
+        problems = get_problems_by_max_rating(all_problems, max_rating)
+
+        logger.iteration_header(iteration + 1, num_iterations, max_rating, len(problems))
+
+        # 1. SUPERVISED BOOTSTRAP
+        supervised_ratio = trainer.get_supervised_ratio()
+        if supervised_ratio > 0:
+            num_supervised = max(1, int(len(problems) * supervised_ratio))
+            logger.supervised_info(num_supervised, supervised_ratio)
+            for problem in problems[:num_supervised]:
+                self_play.supervised_game(problem, replay_buffer)
+
+        # 2. SELF-PLAY
+        model.backbone.eval()
+        with torch.no_grad():
+            self_play_stats = self_play.run_self_play_iteration(
+                problems, replay_buffer, config.training.games_per_problem
+            )
+
+        # 3. TRAINING
+        model.backbone.train()
+        epoch_results = trainer.train_iteration(replay_buffer)
+
+        # 4. EVALUATION
+        model.backbone.eval()
+        with torch.no_grad():
+            eval_results = evaluate_model(model, problems, config)
+
+        eval_wins = sum(1 for r in eval_results if r["won"])
+
+        # 5. LOGGING
+        iter_time = time.time() - iter_start
+        avg_wr = sum(s["win_rate"] for s in self_play_stats) / len(self_play_stats)
+        avg_rw = sum(s["mean_reward"] for s in self_play_stats) / len(self_play_stats)
+
+        iter_log = {
+            "iteration": iteration + 1,
+            "time_seconds": iter_time,
+            "curriculum_max_rating": max_rating,
+            "num_problems": len(problems),
+            "supervised_ratio": supervised_ratio,
+            "replay_buffer_size": len(replay_buffer),
+            "replay_buffer_stats": replay_buffer.stats,
+            "self_play_avg_win_rate": avg_wr,
+            "self_play_avg_reward": avg_rw,
+            "training_losses": epoch_results,
+            "eval_win_rate": eval_wins / len(eval_results),
+            "eval_wins": eval_wins,
+            "eval_total": len(eval_results),
+        }
+        training_log.append(iter_log)
+
+        log_path = os.path.join(config.log_dir, "training_log.json")
+        with open(log_path, "w") as f:
+            json.dump(training_log, f, indent=2)
+
+        if (iteration + 1) % 5 == 0:
+            ckpt_path = os.path.join(config.checkpoint_dir, f"iter_{iteration+1}.pt")
+            trainer.save_checkpoint(ckpt_path)
+
+        logger.iteration_footer(iteration + 1, iter_time, eval_wins, len(eval_results))
+
+    # Final
+    final_path = os.path.join(config.checkpoint_dir, "final.pt")
+    trainer.save_checkpoint(final_path)
+
+    logger.console.print()
+    logger.final_summary(training_log)
+    logger.console.print(f"\n[bold green]Training complete![/]")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AlphaZero-style code generation training")
+    parser.add_argument("--iterations", type=int, default=None)
+    parser.add_argument("--resume", type=str, default=None)
+    args = parser.parse_args()
+    run_pipeline(args)
+
+
+if __name__ == "__main__":
+    main()
