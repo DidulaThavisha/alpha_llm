@@ -6,7 +6,7 @@ from typing import List
 
 @dataclass
 class ModelConfig:
-    name: str = "Qwen/Qwen3.5-2B"
+    name: str = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
     precision: str = "float16"
     max_seq_length: int = 2048
     hidden_size: int = 1536  # Qwen2.5-Coder-1.5B hidden dim
