@@ -35,12 +35,12 @@ class AlphaCodeModel(nn.Module):
         # Detect hidden size from the loaded model
         hidden_size = self.backbone.config.hidden_size
 
-        # Value head — trained from scratch
+        # Value head — trained from scratch, kept in float32 regardless of backbone dtype
         self.value_head = ValueHead(
             hidden_size=hidden_size,
             intermediate_size=self.config.value_head_hidden,
             dropout=self.config.value_head_dropout,
-        ).to(dtype)
+        )
 
     def forward(
         self,

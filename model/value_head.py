@@ -30,4 +30,4 @@ class ValueHead(nn.Module):
         Returns:
             [batch, 1] value prediction in [0, 1]
         """
-        return self.net(hidden_state)
+        return self.net(hidden_state.float())
