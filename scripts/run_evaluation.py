@@ -43,10 +43,10 @@ def evaluate_model(model, problems, config, use_mcts=False, mcts_sims=10):
         reward = compute_reward(result)
         won = reward == 1.0
 
-        logger.eval_problem(problem.title, problem.rating, result.passed, result.total, won)
+        logger.eval_problem(problem.title, problem.rating, result.passed, result.total, won, code=code)
         results.append({"rating": problem.rating, "title": problem.title,
                         "passed": result.passed, "total": result.total,
-                        "reward": reward, "won": won})
+                        "reward": reward, "won": won, "code": code})
 
     wins = sum(1 for r in results if r["won"])
     logger.eval_summary(wins, len(results))

@@ -8,6 +8,7 @@ Each "game" is one attempt to solve a problem:
 5. Store trajectory in replay buffer
 """
 
+import time
 import torch
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -38,8 +39,11 @@ class SelfPlay:
         self,
         problem: CodeProblem,
         use_mcts: bool = True,
-    ) -> Tuple[float, str, List[Dict[str, Any]]]:
-        """Play one self-play game on a problem."""
+    ) -> Tuple[float, str, List[Dict[str, Any]], "ExecutionResult"]:
+        """Play one self-play game on a problem.
+
+        Returns (reward, code, trajectory, execution_result).
+        """
         prompt_text = format_prompt(problem.prompt)
         tokenizer = self.model.tokenizer
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
@@ -57,7 +61,7 @@ class SelfPlay:
         result = self.executor.evaluate(code, test_cases)
         reward = compute_reward(result)
 
-        return reward, code, trajectory
+        return reward, code, trajectory, result
 
     def play_games(
         self,
@@ -75,14 +79,28 @@ class SelfPlay:
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
 
         for game_idx in range(num_games):
-            reward, code, trajectory = self.play_one_game(problem, use_mcts=True)
+            t0 = time.time()
+            reward, code, trajectory, exec_result = self.play_one_game(problem, use_mcts=True)
+            elapsed = time.time() - t0
+
             rewards.append(reward)
             codes.append(code)
 
             if reward == 1.0:
                 unique_solutions.add(code.strip())
 
-            logger.game_result(game_idx + 1, reward, code.split("\n")[0] if code else "")
+            # Log full generation details
+            logger.game_generation(
+                game_num=game_idx + 1,
+                problem_title=problem.title,
+                code=code,
+                reward=reward,
+                passed=exec_result.passed,
+                total=exec_result.total,
+                errors=exec_result.errors[:5],
+                trajectory_len=len(trajectory),
+                time_seconds=elapsed,
+            )
 
             replay_buffer.add_trajectory(
                 trajectory=trajectory,

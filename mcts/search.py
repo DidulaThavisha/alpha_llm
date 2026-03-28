@@ -10,6 +10,7 @@ import math
 from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 
+import logger
 from .node import MCTSNode
 from .utils import select_child, add_dirichlet_noise, get_mcts_policy, sample_from_policy
 from .kv_cache_pool import KVCachePool, clone_kv_cache
@@ -136,39 +137,52 @@ class MCTSSearch:
 
         return unique
 
-    def expand_node(
+    def _get_state_kv(self, prompt_ids: List[int], code_tokens: List[int]) -> Tuple:
+        """Compute KV cache for prompt + code_tokens in one forward pass.
+
+        Returns (kv_cache, value_estimate).
+        """
+        device = self.model.device
+        all_tokens = prompt_ids + code_tokens
+        input_ids = torch.tensor([all_tokens], device=device)
+        out = self.model.forward(input_ids, use_cache=True)
+        return out["past_key_values"], out["value"].item()
+
+    def expand_and_evaluate(
         self,
         node: MCTSNode,
         prompt_ids: List[int],
-    ):
-        """Expand a node by generating candidate child lines.
+    ) -> float:
+        """Expand a node AND get its value in a single forward pass.
 
-        Each child represents a candidate next line of code.
+        Generates candidate child lines using the state KV cache,
+        then returns the value estimate. This avoids the double forward pass
+        that expand_node + evaluate_node would require.
         """
         device = self.model.device
-
-        # Build full token sequence: prompt + code so far
         code_tokens = node.get_cumulative_tokens()
         all_tokens = prompt_ids + code_tokens
         input_ids = torch.tensor([all_tokens], device=device)
-        attention_mask = torch.ones_like(input_ids)
 
-        # Generate candidate lines
+        # Forward pass to get both value AND base KV for candidate generation
+        out = self.model.forward(input_ids, use_cache=True)
+        value = out["value"].item()
+        base_kv = out["past_key_values"]
+
+        # Generate candidates reusing the computed KV cache
         candidates = self.generate_candidate_lines(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=node.kv_cache,
+            past_key_values=base_kv,
             num_candidates=self.config.candidate_lines_k,
         )
 
         if not candidates:
-            return
+            return value
 
-        # Compute priors from log-probabilities (softmax normalized)
+        # Compute priors from log-probabilities
         log_probs = torch.tensor([lp for _, _, lp in candidates])
         priors = F.softmax(log_probs, dim=0).tolist()
 
-        # Create children
         for (tokens, text, _), prior in zip(candidates, priors):
             is_eos = (
                 len(tokens) > 0
@@ -183,53 +197,38 @@ class MCTSSearch:
             )
             node.children.append(child)
 
-    def evaluate_node(self, node: MCTSNode, prompt_ids: List[int]) -> float:
-        """Get value estimate for a node using the value head."""
+        return value
+
+    def _score_children_with_value_head(self, root: MCTSNode, prompt_ids: List[int]):
+        """Score each child with the value head (1-ply lookahead).
+
+        Instead of deep MCTS tree search (too slow for 1.5B model on MPS),
+        we do a shallow but informed search: generate K candidate lines,
+        then evaluate each candidate by running the value head on
+        prompt + code_so_far + candidate_line.
+        """
         device = self.model.device
-        code_tokens = node.get_cumulative_tokens()
-        all_tokens = prompt_ids + code_tokens
 
-        input_ids = torch.tensor([all_tokens], device=device)
-        attention_mask = torch.ones_like(input_ids)
+        for child in root.children:
+            if child.is_terminal:
+                child.total_value = 0.5  # neutral for terminal
+                child.visit_count = 1
+                continue
 
-        out = self.model.forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
-        return out["value"].item()
+            # Build state after appending this child's line
+            child_tokens = root.get_cumulative_tokens() + (child.line_tokens or [])
+            all_tokens = prompt_ids + child_tokens
 
-    def run_simulation(self, root: MCTSNode, prompt_ids: List[int]):
-        """Run one MCTS simulation: select → expand → evaluate → backpropagate."""
-        node = root
-        search_path = [node]
+            # Truncate if too long
+            if len(all_tokens) > self.config.max_tokens:
+                all_tokens = all_tokens[-self.config.max_tokens:]
 
-        # === SELECTION: traverse tree using PUCT ===
-        while node.is_expanded and not node.is_terminal:
-            node = select_child(node, self.config.c_puct)
-            search_path.append(node)
+            input_ids = torch.tensor([all_tokens], device=device)
+            out = self.model.forward(input_ids, use_cache=False)
+            value = out["value"].item()
 
-        # === EXPANSION + EVALUATION ===
-        if node.is_terminal:
-            value = node.terminal_reward if node.terminal_reward is not None else 0.0
-        elif node.depth >= self.config.max_lines:
-            # Hit max depth — treat as terminal with value estimate
-            value = self.evaluate_node(node, prompt_ids)
-        else:
-            # Expand this leaf
-            self.expand_node(node, prompt_ids)
-            # Evaluate the expanded node
-            value = self.evaluate_node(node, prompt_ids)
-
-            # Early pruning: if value too low, don't bother exploring
-            if value < self.config.value_pruning_threshold and node.depth > 3:
-                node.is_terminal = True
-                node.terminal_reward = value
-
-        # === BACKPROPAGATION ===
-        for n in reversed(search_path):
-            n.visit_count += 1
-            n.total_value += value
+            child.total_value = value
+            child.visit_count = 1
 
     def search(
         self,
@@ -238,57 +237,68 @@ class MCTSSearch:
         line_number: int,
         num_simulations: Optional[int] = None,
     ) -> MCTSResult:
-        """Run full MCTS search at one decision point.
+        """1-ply MCTS: generate candidates, score each with value head, pick best.
 
-        Args:
-            prompt_ids: tokenized problem prompt
-            code_tokens_so_far: tokens of code generated so far
-            line_number: current line number (for temperature scheduling)
-            num_simulations: override default simulation count
-
-        Returns:
-            MCTSResult with improved policy and selected child
+        This is the tractable version for a 1.5B model on MPS:
+        - 1 forward pass to generate K candidate lines
+        - K forward passes to score each candidate with the value head
+        - Select based on prior × value (PUCT-like)
+        Total: K+1 forward passes per line decision (not K×N).
         """
-        num_sims = num_simulations or self.config.num_simulations
-
-        # Create root node representing current state
         root = MCTSNode(
             line_tokens=code_tokens_so_far if code_tokens_so_far else None,
             line_text="",
         )
-        # Cache cumulative tokens
         root._cumulative_tokens = code_tokens_so_far.copy()
 
-        # Expand root
-        self.expand_node(root, prompt_ids)
+        # Expand root: 1 forward pass + K candidate line generations
+        root_value = self.expand_and_evaluate(root, prompt_ids)
+        root.visit_count = 1
+        root.total_value = root_value
 
         if not root.children:
-            # No candidates generated — return empty result
             return MCTSResult(policy={}, selected_child_idx=0, root_value=0.0, total_simulations=0)
 
-        # Add Dirichlet noise to root for exploration
         add_dirichlet_noise(root, self.config.dirichlet_alpha, self.config.dirichlet_weight)
 
-        # Run simulations
-        for _ in range(num_sims):
-            self.run_simulation(root, prompt_ids)
+        # Score each child with value head (K forward passes)
+        self._score_children_with_value_head(root, prompt_ids)
 
-        # Extract improved policy from visit counts
+        # Combine prior and value to get policy
+        # score = prior * (1 - alpha) + value * alpha  (blend prior with value)
+        alpha = 0.6  # weight toward value head
+        scores = []
+        for child in root.children:
+            blended = (1 - alpha) * child.prior + alpha * child.q_value
+            scores.append(blended)
+
+        # Normalize to policy
+        total = sum(scores)
+        if total > 0:
+            policy = {i: s / total for i, s in enumerate(scores)}
+        else:
+            policy = {i: 1.0 / len(scores) for i in range(len(scores))}
+
         temperature = (
             self.config.temperature_early
             if line_number < self.config.temperature_switch_line
             else self.config.temperature_late
         )
-        policy = get_mcts_policy(root, temperature)
 
-        # Sample action from policy
+        # Apply temperature
+        if temperature != 1.0 and temperature > 0:
+            import numpy as np
+            adjusted = {k: v ** (1.0 / temperature) for k, v in policy.items()}
+            total = sum(adjusted.values())
+            policy = {k: v / total for k, v in adjusted.items()}
+
         selected_idx = sample_from_policy(policy)
 
         return MCTSResult(
             policy=policy,
             selected_child_idx=selected_idx,
-            root_value=root.q_value,
-            total_simulations=sum(c.visit_count for c in root.children),
+            root_value=root_value,
+            total_simulations=len(root.children),
         )
 
     def generate_solution(
@@ -352,12 +362,21 @@ class MCTSSearch:
             # Regenerate root to get the selected child's tokens
             root = MCTSNode(line_tokens=code_tokens if code_tokens else None)
             root._cumulative_tokens = code_tokens.copy()
-            self.expand_node(root, prompt_ids)
+            self.expand_and_evaluate(root, prompt_ids)
 
             if selected_child_idx >= len(root.children):
                 break
 
             selected = root.children[min(selected_child_idx, len(root.children) - 1)]
+
+            # Log MCTS decision
+            logger.mcts_search_step(
+                line_num=line_num,
+                num_children=len(root.children),
+                best_value=result.root_value,
+                simulations=result.total_simulations,
+                selected_line=selected.line_text,
+            )
 
             trajectory.append({
                 "state_tokens": code_tokens.copy(),

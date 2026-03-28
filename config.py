@@ -20,10 +20,10 @@ class ModelConfig:
 
 @dataclass
 class MCTSConfig:
-    num_simulations: int = 50
+    num_simulations: int = 8
     c_puct: float = 2.5
-    candidate_lines_k: int = 8  # beam search candidates per line
-    num_beams: int = 8
+    candidate_lines_k: int = 4  # candidates per line decision
+    num_beams: int = 4
     top_k_tokens: int = 40  # token-level filtering within beam search
     temperature_early: float = 1.0  # for first N lines
     temperature_late: float = 0.5
@@ -38,8 +38,8 @@ class MCTSConfig:
     # Pruning
     value_pruning_threshold: float = 0.01
     # Max generation
-    max_lines: int = 100
-    max_tokens: int = 2048
+    max_lines: int = 50
+    max_tokens: int = 1024
 
 
 @dataclass
@@ -54,7 +54,7 @@ class TrainingConfig:
     # Replay buffer
     replay_buffer_size: int = 10_000
     # Self-play
-    games_per_problem: int = 8
+    games_per_problem: int = 4
     # Supervised bootstrap (decays over iterations)
     supervised_ratio_start: float = 0.8
     supervised_ratio_end: float = 0.0
