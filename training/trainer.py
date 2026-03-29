@@ -114,6 +114,11 @@ class Trainer:
                 + self.config.training.policy_loss_weight * p_loss
             )
 
+            # NaN guard: skip this sample to prevent gradient corruption
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.console.print("[yellow]  ⚠ NaN/Inf loss detected, skipping sample[/]")
+                continue
+
             loss.backward()
             total_policy_loss += p_loss.item()
             total_value_loss += v_loss.item()
@@ -126,9 +131,17 @@ class Trainer:
                 if param.grad is not None:
                     param.grad /= count
 
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+            # Check for NaN gradients before stepping
+            has_nan_grad = any(
+                torch.isnan(p.grad).any() for p in self.model.parameters() if p.grad is not None
+            )
+            if has_nan_grad:
+                logger.console.print("[yellow]  ⚠ NaN gradients detected, skipping optimizer step[/]")
+                self.optimizer.zero_grad()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
         return {
             "policy_loss": total_policy_loss / max(count, 1),
@@ -185,9 +198,9 @@ class Trainer:
         progress = self.iteration / cfg.supervised_decay_iterations
         return cfg.supervised_ratio_start + progress * (cfg.supervised_ratio_end - cfg.supervised_ratio_start)
 
-    def save_checkpoint(self, path: str):
-        """Save model checkpoint."""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+    def save_checkpoint(self, path: str, hf_sync=None):
+        """Save model checkpoint locally and optionally to HF Hub."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save({
             "iteration": self.iteration,
             "model_state_dict": self.model.state_dict(),
@@ -195,8 +208,24 @@ class Trainer:
         }, path)
         logger.checkpoint_saved(path)
 
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint."""
+        if hf_sync is not None:
+            hf_sync.upload_checkpoint(path)
+
+    def load_checkpoint(self, path: str, hf_sync=None):
+        """Load model checkpoint from local path or HF Hub.
+
+        If path is a filename like 'iter_5.pt' and doesn't exist locally,
+        attempts to download from HF Hub first.
+        """
+        # Try downloading from HF if the local file doesn't exist
+        if not os.path.exists(path) and hf_sync is not None:
+            name = os.path.basename(path)
+            logger.console.print(f"  [dim]Checkpoint not found locally, trying HF Hub...[/]")
+            if hf_sync.download_checkpoint(name, path):
+                logger.console.print(f"  [dim]Downloaded {name} from HF Hub[/]")
+            else:
+                raise FileNotFoundError(f"Checkpoint not found locally or on HF: {path}")
+
         checkpoint = torch.load(path, map_location=self.model.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

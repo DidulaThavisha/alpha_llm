@@ -2,13 +2,19 @@
 
 Each MCTS "move" generates an entire line of code. The search uses the model's
 policy head to propose candidate lines and the value head to evaluate states.
+
+Two search modes:
+- shallow (1-ply): generate K candidates, score each with value head, pick best.
+  Cost: ~2K+1 forward passes per line. Fast but no lookahead.
+- deep (multi-ply): full select-expand-evaluate-backprop MCTS loop.
+  Cost: ~N×D forward passes per line (N=simulations, D=avg depth). Slow but strategic.
 """
 
 import torch
 import torch.nn.functional as F
 import math
 from typing import List, Tuple, Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import logger
 from .node import MCTSNode
@@ -24,6 +30,10 @@ class MCTSResult:
     selected_child_idx: int           # which child was selected
     root_value: float                 # value estimate at root
     total_simulations: int
+    # Selected child data (avoids re-expansion)
+    selected_tokens: List[int] = field(default_factory=list)
+    selected_text: str = ""
+    selected_is_terminal: bool = False
 
 
 class MCTSSearch:
@@ -137,16 +147,11 @@ class MCTSSearch:
 
         return unique
 
-    def _get_state_kv(self, prompt_ids: List[int], code_tokens: List[int]) -> Tuple:
-        """Compute KV cache for prompt + code_tokens in one forward pass.
-
-        Returns (kv_cache, value_estimate).
-        """
-        device = self.model.device
-        all_tokens = prompt_ids + code_tokens
-        input_ids = torch.tensor([all_tokens], device=device)
-        out = self.model.forward(input_ids, use_cache=True)
-        return out["past_key_values"], out["value"].item()
+    def _safe_value(self, raw_value: float) -> float:
+        """Clamp NaN/Inf values to neutral 0.5."""
+        if math.isnan(raw_value) or math.isinf(raw_value):
+            return 0.5
+        return raw_value
 
     def expand_and_evaluate(
         self,
@@ -164,9 +169,13 @@ class MCTSSearch:
         all_tokens = prompt_ids + code_tokens
         input_ids = torch.tensor([all_tokens], device=device)
 
+        # Truncate if too long
+        if len(all_tokens) > self.config.max_tokens:
+            input_ids = input_ids[:, -self.config.max_tokens:]
+
         # Forward pass to get both value AND base KV for candidate generation
         out = self.model.forward(input_ids, use_cache=True)
-        value = out["value"].item()
+        value = self._safe_value(out["value"].item())
         base_kv = out["past_key_values"]
 
         # Generate candidates reusing the computed KV cache
@@ -225,10 +234,14 @@ class MCTSSearch:
 
             input_ids = torch.tensor([all_tokens], device=device)
             out = self.model.forward(input_ids, use_cache=False)
-            value = out["value"].item()
+            value = self._safe_value(out["value"].item())
 
             child.total_value = value
             child.visit_count = 1
+
+    # =========================================================================
+    # Search dispatch
+    # =========================================================================
 
     def search(
         self,
@@ -237,13 +250,28 @@ class MCTSSearch:
         line_number: int,
         num_simulations: Optional[int] = None,
     ) -> MCTSResult:
+        """Run MCTS search at one decision point.
+
+        Dispatches to shallow (1-ply) or deep (multi-ply) based on config.
+        """
+        if self.config.search_mode == "deep":
+            return self._search_deep(prompt_ids, code_tokens_so_far, line_number, num_simulations)
+        return self._search_shallow(prompt_ids, code_tokens_so_far, line_number, num_simulations)
+
+    # =========================================================================
+    # Shallow search (1-ply)
+    # =========================================================================
+
+    def _search_shallow(
+        self,
+        prompt_ids: List[int],
+        code_tokens_so_far: List[int],
+        line_number: int,
+        num_simulations: Optional[int] = None,
+    ) -> MCTSResult:
         """1-ply MCTS: generate candidates, score each with value head, pick best.
 
-        This is the tractable version for a 1.5B model on MPS:
-        - 1 forward pass to generate K candidate lines
-        - K forward passes to score each candidate with the value head
-        - Select based on prior × value (PUCT-like)
-        Total: K+1 forward passes per line decision (not K×N).
+        Cost: ~2K+1 forward passes per line decision.
         """
         root = MCTSNode(
             line_tokens=code_tokens_so_far if code_tokens_so_far else None,
@@ -265,7 +293,6 @@ class MCTSSearch:
         self._score_children_with_value_head(root, prompt_ids)
 
         # Combine prior and value to get policy
-        # score = prior * (1 - alpha) + value * alpha  (blend prior with value)
         alpha = 0.6  # weight toward value head
         scores = []
         for child in root.children:
@@ -287,19 +314,151 @@ class MCTSSearch:
 
         # Apply temperature
         if temperature != 1.0 and temperature > 0:
-            import numpy as np
             adjusted = {k: v ** (1.0 / temperature) for k, v in policy.items()}
             total = sum(adjusted.values())
-            policy = {k: v / total for k, v in adjusted.items()}
+            if total > 0:
+                policy = {k: v / total for k, v in adjusted.items()}
 
         selected_idx = sample_from_policy(policy)
+        selected = root.children[selected_idx]
 
         return MCTSResult(
             policy=policy,
             selected_child_idx=selected_idx,
             root_value=root_value,
             total_simulations=len(root.children),
+            selected_tokens=selected.line_tokens or [],
+            selected_text=selected.line_text,
+            selected_is_terminal=selected.is_terminal,
         )
+
+    # =========================================================================
+    # Deep search (multi-ply, full AlphaZero MCTS)
+    # =========================================================================
+
+    def _search_deep(
+        self,
+        prompt_ids: List[int],
+        code_tokens_so_far: List[int],
+        line_number: int,
+        num_simulations: Optional[int] = None,
+    ) -> MCTSResult:
+        """Full multi-ply MCTS: select → expand → evaluate → backpropagate.
+
+        Each simulation traverses the tree from root to a leaf using PUCT,
+        expands the leaf by generating candidate lines, evaluates with the
+        value head, and backpropagates the value up to root.
+
+        Cost: ~N forward passes (each simulation expands one leaf node).
+        Tree depth grows organically — PUCT naturally balances depth vs width.
+        """
+        n_sims = num_simulations or self.config.num_simulations
+
+        # Build root
+        root = MCTSNode(
+            line_tokens=code_tokens_so_far if code_tokens_so_far else None,
+            line_text="",
+        )
+        root._cumulative_tokens = code_tokens_so_far.copy()
+
+        # Expand root first (always need at least 1 expansion)
+        root_value = self.expand_and_evaluate(root, prompt_ids)
+        root.visit_count = 1
+        root.total_value = root_value
+
+        if not root.children:
+            return MCTSResult(policy={}, selected_child_idx=0, root_value=0.0, total_simulations=0)
+
+        # Dirichlet noise at root for exploration
+        add_dirichlet_noise(root, self.config.dirichlet_alpha, self.config.dirichlet_weight)
+
+        # === Main simulation loop ===
+        for sim in range(n_sims):
+            # --- SELECT ---
+            # Walk down the tree using PUCT until we hit an unexpanded non-terminal node
+            node = root
+            search_path = [node]
+
+            while node.is_expanded and not node.is_terminal:
+                child = select_child(node, self.config.c_puct)
+                if child is None:
+                    break
+                node = child
+                search_path.append(node)
+
+                # Enforce max depth — treat as leaf
+                if node.depth >= self.config.max_search_depth:
+                    break
+
+            # --- EXPAND & EVALUATE ---
+            if node.is_terminal:
+                # Terminal node: use its reward or neutral
+                value = node.terminal_reward if node.terminal_reward is not None else 0.0
+            elif not node.is_expanded:
+                # Leaf: expand and get value estimate
+                value = self.expand_and_evaluate(node, prompt_ids)
+            else:
+                # Hit max depth or already expanded (no new children) — use current value
+                value = node.q_value if node.visit_count > 0 else 0.5
+
+            # --- Prune ---
+            # If the value is below threshold and this isn't root, skip backprop
+            # (don't waste visits on clearly bad branches)
+            if (value < self.config.value_pruning_threshold
+                    and node is not root
+                    and node.visit_count > 0):
+                continue
+
+            # --- BACKPROPAGATE ---
+            for bp_node in reversed(search_path):
+                bp_node.visit_count += 1
+                bp_node.total_value += value
+
+        # === Extract policy from visit counts ===
+        temperature = (
+            self.config.temperature_early
+            if line_number < self.config.temperature_switch_line
+            else self.config.temperature_late
+        )
+        policy = get_mcts_policy(root, temperature)
+
+        if not policy:
+            return MCTSResult(policy={}, selected_child_idx=0, root_value=root_value, total_simulations=n_sims)
+
+        selected_idx = sample_from_policy(policy)
+        selected = root.children[selected_idx]
+
+        # Log tree stats
+        max_depth = self._tree_max_depth(root)
+        total_nodes = self._tree_node_count(root)
+        logger.console.print(
+            f"        [dim]deep MCTS: {n_sims} sims · {total_nodes} nodes · depth {max_depth} · "
+            f"best Q={selected.q_value:.3f} visits={selected.visit_count}[/]"
+        )
+
+        return MCTSResult(
+            policy=policy,
+            selected_child_idx=selected_idx,
+            root_value=root_value,
+            total_simulations=n_sims,
+            selected_tokens=selected.line_tokens or [],
+            selected_text=selected.line_text,
+            selected_is_terminal=selected.is_terminal,
+        )
+
+    def _tree_max_depth(self, node: MCTSNode) -> int:
+        """Get maximum depth of the tree."""
+        if not node.children:
+            return 0
+        return 1 + max(self._tree_max_depth(c) for c in node.children)
+
+    def _tree_node_count(self, node: MCTSNode) -> int:
+        """Count total nodes in tree."""
+        return 1 + sum(self._tree_node_count(c) for c in node.children)
+
+    # =========================================================================
+    # Solution generation
+    # =========================================================================
 
     def generate_solution(
         self,
@@ -354,40 +513,28 @@ class MCTSSearch:
                 line_number=line_num,
             )
 
-            if not result.policy:
+            if not result.policy or not result.selected_tokens:
                 break
-
-            selected_child_idx = result.selected_child_idx
-
-            # Regenerate root to get the selected child's tokens
-            root = MCTSNode(line_tokens=code_tokens if code_tokens else None)
-            root._cumulative_tokens = code_tokens.copy()
-            self.expand_and_evaluate(root, prompt_ids)
-
-            if selected_child_idx >= len(root.children):
-                break
-
-            selected = root.children[min(selected_child_idx, len(root.children) - 1)]
 
             # Log MCTS decision
             logger.mcts_search_step(
                 line_num=line_num,
-                num_children=len(root.children),
+                num_children=len(result.policy),
                 best_value=result.root_value,
                 simulations=result.total_simulations,
-                selected_line=selected.line_text,
+                selected_line=result.selected_text,
             )
 
             trajectory.append({
                 "state_tokens": code_tokens.copy(),
                 "mcts_policy": result.policy,
-                "selected_line": selected.line_text,
+                "selected_line": result.selected_text,
                 "value_estimate": result.root_value,
             })
 
-            code_tokens.extend(selected.line_tokens)
+            code_tokens.extend(result.selected_tokens)
 
-            if selected.is_terminal:
+            if result.selected_is_terminal:
                 break
             if len(code_tokens) >= self.config.max_tokens:
                 break

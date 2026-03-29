@@ -1,6 +1,6 @@
 """End-to-end AlphaZero training loop for code generation.
 
-Usage: python -m scripts.run_full_pipeline [--iterations N] [--resume PATH]
+Usage: python -m scripts.run_full_pipeline [--iterations N] [--resume PATH] [--hf-repo REPO]
 """
 
 import sys
@@ -75,12 +75,35 @@ def evaluate_model(model, problems, config):
     return results
 
 
+def setup_hf_sync(config, args):
+    """Create HFSync if a repo is configured."""
+    repo = getattr(args, "hf_repo", None) or config.hf_repo
+    if not repo:
+        return None
+    from hf_sync import HFSync
+    sync = HFSync(repo)
+    logger.console.print(f"  HF Hub: [bold]{repo}[/]")
+    return sync
+
+
 def run_pipeline(args):
     config = get_config()
     device = get_device(config)
 
+    # Apply MCTS mode from CLI
+    if args.mcts_mode is not None:
+        config.mcts.search_mode = args.mcts_mode
+    if args.mcts_sims is not None:
+        config.mcts.num_simulations = args.mcts_sims
+    elif config.mcts.search_mode == "deep" and config.mcts.num_simulations < 16:
+        config.mcts.num_simulations = 32  # sensible default for deep
+
     logger.banner()
     logger.console.print(f"  Device: [bold]{device}[/] · Model: [bold]{config.model.name}[/]")
+    logger.console.print(f"  MCTS: [bold]{config.mcts.search_mode}[/] · {config.mcts.num_simulations} sims")
+
+    # HF Hub sync
+    hf_sync = setup_hf_sync(config, args)
 
     logger.console.print("\n[dim]Loading model...[/]")
     model = AlphaCodeModel(config.model)
@@ -93,8 +116,19 @@ def run_pipeline(args):
     self_play = SelfPlay(model, config)
     trainer = Trainer(model, config)
 
+    # Resume from checkpoint (tries HF Hub if local file missing)
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        if args.resume == "latest" and hf_sync is not None:
+            # Auto-find latest checkpoint from HF
+            latest = hf_sync.get_latest_checkpoint()
+            if latest:
+                ckpt_name = os.path.basename(latest)
+                local_path = os.path.join(config.checkpoint_dir, ckpt_name)
+                trainer.load_checkpoint(local_path, hf_sync=hf_sync)
+            else:
+                logger.console.print("[yellow]  No checkpoints found on HF Hub, starting fresh[/]")
+        else:
+            trainer.load_checkpoint(args.resume, hf_sync=hf_sync)
 
     all_problems = load_problems(config.dataset_path)
     logger.console.print(f"  Loaded [bold]{len(all_problems)}[/] problems (rating {all_problems[0].rating}–{all_problems[-1].rating})")
@@ -162,19 +196,23 @@ def run_pipeline(args):
         }
         training_log.append(iter_log)
 
+        # Save training log locally + HF
         log_path = os.path.join(config.log_dir, "training_log.json")
         with open(log_path, "w") as f:
             json.dump(training_log, f, indent=2)
+        if hf_sync is not None:
+            hf_sync.upload_log(log_path)
 
+        # Save checkpoint every 5 iterations
         if (iteration + 1) % 5 == 0:
             ckpt_path = os.path.join(config.checkpoint_dir, f"iter_{iteration+1}.pt")
-            trainer.save_checkpoint(ckpt_path)
+            trainer.save_checkpoint(ckpt_path, hf_sync=hf_sync)
 
         logger.iteration_footer(iteration + 1, iter_time, eval_wins, len(eval_results))
 
-    # Final
+    # Final checkpoint
     final_path = os.path.join(config.checkpoint_dir, "final.pt")
-    trainer.save_checkpoint(final_path)
+    trainer.save_checkpoint(final_path, hf_sync=hf_sync)
 
     logger.console.print()
     logger.final_summary(training_log)
@@ -184,7 +222,14 @@ def run_pipeline(args):
 def main():
     parser = argparse.ArgumentParser(description="AlphaZero-style code generation training")
     parser.add_argument("--iterations", type=int, default=None)
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint, or 'latest' to auto-download from HF Hub")
+    parser.add_argument("--mcts-mode", choices=["shallow", "deep"], default=None,
+                        help="MCTS search mode: shallow (1-ply, fast) or deep (multi-ply, full MCTS)")
+    parser.add_argument("--mcts-sims", type=int, default=None,
+                        help="Number of MCTS simulations (default: 8 shallow, 32 deep)")
+    parser.add_argument("--hf-repo", type=str, default=None,
+                        help="HuggingFace repo for checkpoint sync (e.g. username/alpha-llm)")
     args = parser.parse_args()
     run_pipeline(args)
 

@@ -10,6 +10,7 @@ class ModelConfig:
     precision: str = "float16"
     max_seq_length: int = 2048
     hidden_size: int = 1536  # Qwen2.5-Coder-1.5B hidden dim
+
     value_head_hidden: int = 512
     value_head_dropout: float = 0.1
     # LoRA
@@ -22,7 +23,7 @@ class ModelConfig:
 class MCTSConfig:
     num_simulations: int = 8
     c_puct: float = 2.5
-    candidate_lines_k: int = 4  # candidates per line decision
+    candidate_lines_k: int = 8  # candidates per line decision
     num_beams: int = 4
     top_k_tokens: int = 40  # token-level filtering within beam search
     temperature_early: float = 1.0  # for first N lines
@@ -40,6 +41,9 @@ class MCTSConfig:
     # Max generation
     max_lines: int = 50
     max_tokens: int = 1024
+    # Search mode: "shallow" (1-ply, fast) or "deep" (multi-ply, full MCTS)
+    search_mode: str = "deep"
+    max_search_depth: int = 5  # max tree depth for deep MCTS
 
 
 @dataclass
@@ -88,7 +92,23 @@ class AlphaCodeConfig:
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
     device: str = "auto"  # auto-detect: mps > cuda > cpu
+    # HuggingFace Hub for persistent checkpoint storage (set via --hf-repo)
+    hf_repo: str = "DidulaThavishaPro/alpha-llm-checkpoints"  # e.g. "username/alpha-llm-checkpoints"
 
 
 def get_config() -> AlphaCodeConfig:
     return AlphaCodeConfig()
+
+
+
+# # Login to HF (do this once in a notebook cell)
+# !huggingface-cli login --token YOUR_HF_TOKEN
+
+# # Fresh start — checkpoints auto-upload to HF
+# !python -m scripts.run_full_pipeline --iterations 10 --hf-repo DidulaThavishaPro/alpha-llm-checkpoints
+
+# # Resume from where you left off (auto-downloads latest checkpoint from HF)
+# !python -m scripts.run_full_pipeline --iterations 20 --resume latest --hf-repo DidulaThavishaPro/alpha-llm-checkpoints
+
+# # Evaluate using a checkpoint from HF
+# !python -m scripts.run_evaluation --checkpoint latest --hf-repo DidulaThavishaPro/alpha-llm-checkpoints

@@ -1,0 +1,166 @@
+[
+  {
+    "iteration": 1,
+    "time_seconds": 11481.061529874802,
+    "curriculum_max_rating": 1200,
+    "num_problems": 5,
+    "supervised_ratio": 0.8,
+    "replay_buffer_size": 232,
+    "replay_buffer_stats": {
+      "size": 232,
+      "wins": 61,
+      "losses": 128,
+      "partial": 43,
+      "win_rate": 0.2629310344827586,
+      "mean_outcome": -0.3439655172413793
+    },
+    "self_play_avg_win_rate": 0.0,
+    "self_play_avg_reward": -0.8079166666666666,
+    "training_losses": [
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 116
+      },
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 116
+      },
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 116
+      }
+    ],
+    "eval_win_rate": 0.0,
+    "eval_wins": 0,
+    "eval_total": 5
+  },
+  {
+    "iteration": 2,
+    "time_seconds": 10035.587574005127,
+    "curriculum_max_rating": 1200,
+    "num_problems": 5,
+    "supervised_ratio": 0.7733333333333334,
+    "replay_buffer_size": 420,
+    "replay_buffer_stats": {
+      "size": 420,
+      "wins": 89,
+      "losses": 272,
+      "partial": 59,
+      "win_rate": 0.2119047619047619,
+      "mean_outcome": -0.48523809523809525
+    },
+    "self_play_avg_win_rate": 0.0,
+    "self_play_avg_reward": -0.95,
+    "training_losses": [
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 210
+      },
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 210
+      },
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 210
+      }
+    ],
+    "eval_win_rate": 0.0,
+    "eval_wins": 0,
+    "eval_total": 5
+  },
+  {
+    "iteration": 3,
+    "time_seconds": 23055.357836961746,
+    "curriculum_max_rating": 1200,
+    "num_problems": 5,
+    "supervised_ratio": 0.7466666666666667,
+    "replay_buffer_size": 608,
+    "replay_buffer_stats": {
+      "size": 608,
+      "wins": 117,
+      "losses": 424,
+      "partial": 67,
+      "win_rate": 0.1924342105263158,
+      "mean_outcome": -0.5457236842105263
+    },
+    "self_play_avg_win_rate": 0.0,
+    "self_play_avg_reward": -0.975,
+    "training_losses": [
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 304
+      },
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 304
+      },
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 304
+      }
+    ],
+    "eval_win_rate": 0.0,
+    "eval_wins": 0,
+    "eval_total": 5
+  },
+  {
+    "iteration": 4,
+    "time_seconds": 11416.79806470871,
+    "curriculum_max_rating": 1200,
+    "num_problems": 5,
+    "supervised_ratio": 0.72,
+    "replay_buffer_size": 796,
+    "replay_buffer_stats": {
+      "size": 796,
+      "wins": 145,
+      "losses": 584,
+      "partial": 67,
+      "win_rate": 0.18216080402010051,
+      "mean_outcome": -0.5826633165829146
+    },
+    "self_play_avg_win_rate": 0.0,
+    "self_play_avg_reward": -1.0,
+    "training_losses": [
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 398
+      },
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 398
+      },
+      {
+        "policy_loss": 0.0,
+        "value_loss": NaN,
+        "total_loss": NaN,
+        "steps": 398
+      }
+    ],
+    "eval_win_rate": 0.0,
+    "eval_wins": 0,
+    "eval_total": 5
+  }
+]
