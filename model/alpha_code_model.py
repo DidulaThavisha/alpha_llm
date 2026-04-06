@@ -22,7 +22,7 @@ class AlphaCodeModel(nn.Module):
         dtype = getattr(torch, self.config.precision)
         self.backbone = AutoModelForCausalLM.from_pretrained(
             self.config.name,
-            torch_dtype=dtype,
+            dtype=dtype,
             trust_remote_code=True,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
