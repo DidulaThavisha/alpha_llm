@@ -41,7 +41,7 @@ class MCTSConfig:
     # Pruning
     value_pruning_threshold: float = 0.01
     # Max generation
-    max_lines: int = 50
+    max_lines: int = 200
     max_tokens: int = 1024
     # Search mode: "shallow" (1-ply, fast) or "deep" (multi-ply, full MCTS)
     search_mode: str = "deep"
