@@ -22,6 +22,19 @@ from training.trainer import Trainer
 from training.replay_buffer import ReplayBuffer
 
 
+hf_token = os.environ.get("HF_TOKEN")
+
+if os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+    print("Running in Kaggle")
+    if not hf_token:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            hf_token = UserSecretsClient().get_secret("HF_TOKEN")
+            os.environ["HF_TOKEN"] = hf_token
+        except Exception:
+            pass
+
+
 def get_device(config):
     if config.device == "auto":
         if torch.backends.mps.is_available():
