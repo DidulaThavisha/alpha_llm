@@ -7,7 +7,7 @@ from typing import List
 @dataclass
 class ModelConfig:
     # name: str = "Qwen/Qwen3.5-2B"
-    name: str = "Qwen/Qwen2.5-Coder-1.5B"
+    name: str = "Qwen/Qwen3.5-4B"
     precision: str = "float16"
     max_seq_length: int = 2048
     hidden_size: int = 1536  # Qwen2.5-Coder-1.5B hidden dim
@@ -15,6 +15,7 @@ class ModelConfig:
     value_head_hidden: int = 512
     value_head_dropout: float = 0.1
     # LoRA
+    load_in_4bit: bool = True
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
@@ -52,7 +53,7 @@ class TrainingConfig:
     backbone_lr: float = 1e-5
     value_head_lr: float = 1e-3
     weight_decay: float = 0.01
-    batch_size: int = 2
+    batch_size: int = 8
     grad_accumulation_steps: int = 4  # effective batch = 8
     epochs_per_iteration: int = 3
     max_iterations: int = 100

@@ -1,12 +1,13 @@
 """Dual-headed AlphaCode model: policy (next token) + value (win probability).
 
-Wraps a pretrained causal LM (Qwen2.5-Coder-1.5B-Instruct) with an added
-value head. The original lm_head serves as the policy head.
+Wraps a pretrained causal LM (Qwen2.5-Coder / Qwen3) via Unsloth's
+FastLanguageModel for faster training and lower memory usage.
+The original lm_head serves as the policy head; a bolted-on ValueHead
+predicts P(win) from the last token's hidden state.
 """
-
+from unsloth import FastLanguageModel
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Optional, Tuple, Dict, Any
 
 from .value_head import ValueHead
@@ -18,24 +19,27 @@ class AlphaCodeModel(nn.Module):
         super().__init__()
         self.config = config or ModelConfig()
 
-        # Load pretrained model
         dtype = getattr(torch, self.config.precision)
-        self.backbone = AutoModelForCausalLM.from_pretrained(
-            self.config.name,
+        self.backbone, self.tokenizer = FastLanguageModel.from_pretrained(
+            model_name=self.config.name,
+            max_seq_length=self.config.max_seq_length,
             dtype=dtype,
-            trust_remote_code=True,
+            load_in_4bit=self.config.load_in_4bit,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.name,
-            trust_remote_code=True,
-        )
+
+        # Unsloth may return a Processor (e.g. for VL models) instead of a plain tokenizer.
+        # Unwrap to the underlying tokenizer so .encode() / .decode() are available.
+        if hasattr(self.tokenizer, 'tokenizer'):
+            self.tokenizer = self.tokenizer.tokenizer
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Detect hidden size from the loaded model
-        hidden_size = self.backbone.config.hidden_size
+        # VL models (e.g. Qwen3.5) nest hidden_size under text_config
+        cfg = self.backbone.config
+        hidden_size = getattr(cfg, 'hidden_size', None) or cfg.text_config.hidden_size
 
-        # Value head — trained from scratch, kept in float32 regardless of backbone dtype
+        # Value head — trained from scratch, always in float32 to avoid LayerNorm overflow
         self.value_head = ValueHead(
             hidden_size=hidden_size,
             intermediate_size=self.config.value_head_hidden,
@@ -50,12 +54,6 @@ class AlphaCodeModel(nn.Module):
         use_cache: bool = True,
     ) -> Dict[str, Any]:
         """Forward pass returning policy logits, value, and KV cache.
-
-        Args:
-            input_ids: [batch, seq_len] token IDs
-            attention_mask: [batch, seq_len] attention mask
-            past_key_values: cached key-values for incremental decoding
-            use_cache: whether to return updated KV cache
 
         Returns:
             dict with keys:
@@ -74,7 +72,6 @@ class AlphaCodeModel(nn.Module):
         logits = outputs.logits  # [batch, seq_len, vocab_size]
         hidden_states = outputs.hidden_states[-1]  # last layer: [batch, seq_len, hidden]
 
-        # Value from the last token position
         last_hidden = hidden_states[:, -1, :]  # [batch, hidden]
         value = self.value_head(last_hidden)  # [batch, 1]
 
@@ -101,23 +98,29 @@ class AlphaCodeModel(nn.Module):
         return log_probs, value_scalar, out["past_key_values"]
 
     def apply_lora(self):
-        """Apply LoRA adapters for efficient fine-tuning."""
-        from peft import LoraConfig, get_peft_model
-
-        lora_config = LoraConfig(
+        """Apply LoRA adapters via Unsloth's optimized get_peft_model."""
+        self.backbone = FastLanguageModel.get_peft_model(
+            self.backbone,
             r=self.config.lora_rank,
-            lora_alpha=self.config.lora_alpha,
             target_modules=self.config.lora_target_modules,
+            lora_alpha=self.config.lora_alpha,
             lora_dropout=0.05,
             bias="none",
-            task_type="CAUSAL_LM",
+            use_gradient_checkpointing="unsloth",
+            random_state=42,
         )
-        self.backbone = get_peft_model(self.backbone, lora_config)
-        print(f"LoRA applied. Trainable params: {self.backbone.print_trainable_parameters()}")
+        self.backbone.print_trainable_parameters()
+
+    def for_inference(self):
+        """Switch backbone to Unsloth's optimized inference mode (2x faster)."""
+        FastLanguageModel.for_inference(self.backbone)
+
+    def for_training(self):
+        """Switch backbone back to training mode after for_inference()."""
+        FastLanguageModel.for_training(self.backbone)
 
     def to_device(self, device: str) -> "AlphaCodeModel":
-        """Move model to device."""
-        self.backbone = self.backbone.to(device)
+        """Move value head to device (backbone placement is managed by Unsloth)."""
         self.value_head = self.value_head.to(device)
         return self
 
